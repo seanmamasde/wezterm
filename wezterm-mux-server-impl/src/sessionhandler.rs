@@ -47,6 +47,8 @@ pub(crate) struct PerPane {
     seqno: SequenceNo,
     config_generation: usize,
     pub(crate) notifications: Vec<Alert>,
+    /// A push is already queued; it will pick up any output that arrives before it runs.
+    push_scheduled: bool,
 }
 
 impl PerPane {
@@ -239,7 +241,17 @@ impl SessionHandler {
     pub fn schedule_pane_push(&mut self, pane_id: PaneId) {
         let sender = self.to_write_tx.clone();
         let per_pane = self.per_pane(pane_id);
+        {
+            // Under heavy output, queuing one push per output burst let the main thread fall
+            // tens of seconds behind; a single queued push per pane sends the same final state.
+            let mut state = per_pane.lock().unwrap();
+            if state.push_scheduled {
+                return;
+            }
+            state.push_scheduled = true;
+        }
         spawn_into_main_thread(async move {
+            per_pane.lock().unwrap().push_scheduled = false;
             let mux = Mux::get();
             let pane = mux
                 .get_pane(pane_id)
