@@ -56,6 +56,82 @@ struct CachedProcInfo {
     root: LocalProcessInfo,
     updated: Instant,
     foreground: LocalProcessInfo,
+    updating: bool,
+}
+
+impl CachedProcInfo {
+    fn new(root: LocalProcessInfo) -> Self {
+        // Windows doesn't have any job control or session concept,
+        // so we infer that the equivalent to the process group
+        // leader is the most recently spawned program running
+        // in the console
+        let mut youngest = &root;
+
+        fn find_youngest<'a>(proc: &'a LocalProcessInfo, youngest: &mut &'a LocalProcessInfo) {
+            if proc.start_time >= youngest.start_time {
+                *youngest = proc;
+            }
+
+            for child in proc.children.values() {
+                #[cfg(windows)]
+                if child.console == 0 {
+                    continue;
+                }
+                find_youngest(child, youngest);
+            }
+        }
+
+        find_youngest(&root, &mut youngest);
+        let mut foreground = youngest.clone();
+        foreground.children.clear();
+
+        Self {
+            root,
+            foreground,
+            updated: Instant::now(),
+            updating: false,
+        }
+    }
+
+    /// Returns the cached info for `pid`, fetching it first if there is none
+    /// yet or if `policy` asks for fresh info.
+    /// Otherwise stale info is returned right away and refreshed in another
+    /// thread: on Windows that means snapshotting every process and thread
+    /// on the system, and the mux server asks for this for every update
+    /// that it sends to a client.
+    fn get(
+        cache: &Arc<Mutex<Option<Self>>>,
+        pid: u32,
+        policy: CachePolicy,
+    ) -> Option<MappedMutexGuard<'_, Self>> {
+        let mut cached = cache.lock();
+        match cached.as_mut() {
+            Some(info) if policy == CachePolicy::AllowStale => {
+                if info.updated.elapsed() > PROC_INFO_CACHE_TTL && !info.updating {
+                    info.updating = true;
+                    let cache = Arc::clone(cache);
+                    std::thread::spawn(move || {
+                        let fresh = LocalProcessInfo::with_root_pid(pid).map(Self::new);
+                        let mut cached = cache.lock();
+                        if let Some(fresh) = fresh {
+                            cached.replace(fresh);
+                        } else if let Some(stale) = cached.as_mut() {
+                            // The process probably just exited; keep the last
+                            // info and try again once the TTL has passed again
+                            stale.updating = false;
+                            stale.updated = Instant::now();
+                        }
+                    });
+                }
+            }
+            _ => {
+                log::trace!("CachedProcInfo expired, refresh");
+                cached.replace(Self::new(LocalProcessInfo::with_root_pid(pid)?));
+                log::trace!("CachedProcInfo updated");
+            }
+        }
+        Some(MutexGuard::map(cached, |info| info.as_mut().unwrap()))
+    }
 }
 
 /// This is a bit horrible; it can take 700us to tcgetpgrp, so if we have
@@ -129,7 +205,7 @@ pub struct LocalPane {
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
-    proc_list: Mutex<Option<CachedProcInfo>>,
+    proc_list: Arc<Mutex<Option<CachedProcInfo>>>,
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
@@ -1033,7 +1109,7 @@ impl LocalPane {
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain: Mutex::new(None),
-            proc_list: Mutex::new(None),
+            proc_list: Arc::new(Mutex::new(None)),
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
@@ -1090,54 +1166,7 @@ impl LocalPane {
         policy: CachePolicy,
     ) -> Option<MappedMutexGuard<'_, CachedProcInfo>> {
         if let ProcessState::Running { pid: Some(pid), .. } = &*self.process.lock() {
-            let mut proc_list = self.proc_list.lock();
-
-            let expired = policy == CachePolicy::FetchImmediate
-                || proc_list
-                    .as_ref()
-                    .map(|info| info.updated.elapsed() > PROC_INFO_CACHE_TTL)
-                    .unwrap_or(true);
-
-            if expired {
-                log::trace!("CachedProcInfo expired, refresh");
-                let root = LocalProcessInfo::with_root_pid(*pid)?;
-
-                // Windows doesn't have any job control or session concept,
-                // so we infer that the equivalent to the process group
-                // leader is the most recently spawned program running
-                // in the console
-                let mut youngest = &root;
-
-                fn find_youngest<'a>(
-                    proc: &'a LocalProcessInfo,
-                    youngest: &mut &'a LocalProcessInfo,
-                ) {
-                    if proc.start_time >= youngest.start_time {
-                        *youngest = proc;
-                    }
-
-                    for child in proc.children.values() {
-                        #[cfg(windows)]
-                        if child.console == 0 {
-                            continue;
-                        }
-                        find_youngest(child, youngest);
-                    }
-                }
-
-                find_youngest(&root, &mut youngest);
-                let mut foreground = youngest.clone();
-                foreground.children.clear();
-
-                proc_list.replace(CachedProcInfo {
-                    root,
-                    foreground,
-                    updated: Instant::now(),
-                });
-                log::trace!("CachedProcInfo updated");
-            }
-
-            return Some(MutexGuard::map(proc_list, |info| info.as_mut().unwrap()));
+            return CachedProcInfo::get(&self.proc_list, *pid, policy);
         }
         None
     }
@@ -1159,5 +1188,39 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+mod test {
+    use super::*;
+
+    #[test]
+    fn stale_proc_info_is_refreshed_in_the_background() {
+        let cache = Arc::new(Mutex::new(None));
+        let pid = std::process::id();
+        let filled = CachedProcInfo::get(&cache, pid, CachePolicy::AllowStale)
+            .expect("info about our own process")
+            .updated;
+
+        let stale = filled - PROC_INFO_CACHE_TTL * 2;
+        cache.lock().as_mut().unwrap().updated = stale;
+        let returned = CachedProcInfo::get(&cache, pid, CachePolicy::AllowStale)
+            .unwrap()
+            .updated;
+        assert_eq!(returned, stale, "stale info is returned without waiting");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while cache.lock().as_ref().unwrap().updated == stale {
+            assert!(Instant::now() < deadline, "the refresh never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let refreshed = cache.lock().as_ref().unwrap().updated;
+        assert!(refreshed > filled && !cache.lock().as_ref().unwrap().updating);
+
+        let fetched = CachedProcInfo::get(&cache, pid, CachePolicy::FetchImmediate)
+            .unwrap()
+            .updated;
+        assert!(fetched > refreshed, "FetchImmediate fetches first");
     }
 }
