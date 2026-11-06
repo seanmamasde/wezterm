@@ -1220,7 +1220,7 @@ impl TabInner {
             return;
         }
 
-        fn compute_size(node: &mut Tree) -> Option<TerminalSize> {
+        fn compute_size(node: &mut Tree, changed: &mut bool) -> Option<TerminalSize> {
             match node {
                 Tree::Empty => None,
                 Tree::Leaf(pane) => {
@@ -1236,10 +1236,12 @@ impl TabInner {
                 }
                 Tree::Node { left, right, data } => {
                     if let Some(data) = data {
-                        if let Some(first) = compute_size(left) {
+                        if let Some(first) = compute_size(left, changed) {
+                            *changed |= data.first != first;
                             data.first = first;
                         }
-                        if let Some(second) = compute_size(right) {
+                        if let Some(second) = compute_size(right, changed) {
+                            *changed |= data.second != second;
                             data.second = second;
                         }
                         Some(data.size())
@@ -1250,12 +1252,18 @@ impl TabInner {
             }
         }
 
+        let mut changed = false;
         if let Some(root) = self.pane.as_mut() {
-            if let Some(size) = compute_size(root) {
+            if let Some(size) = compute_size(root, &mut changed) {
+                changed |= self.size != size;
                 self.size = size;
             }
         }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        // Every TabResized makes each attached client re-list all panes and re-apply sizes,
+        // so announcing no-op resizes let several clients bounce resizes off each other forever.
+        if changed {
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        }
     }
 
     fn resize_split_by(&mut self, split_index: usize, delta: isize) {
