@@ -104,20 +104,21 @@ impl PerPane {
         let viewport_range =
             dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
 
-        let (first_line, lines) = pane.get_lines(viewport_range);
-        let mut bonus_lines = lines
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, line)| {
+        // Copy only the dirty rows of the viewport, not every visible row.
+        let mut bonus_lines = vec![];
+        for range in all_dirty_lines
+            .intersection_with_range(viewport_range)
+            .iter()
+        {
+            let (first_line, lines) = pane.get_lines(range.clone());
+            for (idx, line) in lines.into_iter().enumerate() {
                 let stable_row = first_line + idx as StableRowIndex;
-                if all_dirty_lines.contains(stable_row) {
-                    all_dirty_lines.remove(stable_row);
-                    Some((stable_row, line))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+                bonus_lines.push((stable_row, line));
+            }
+        }
+        for (stable_row, _) in &bonus_lines {
+            all_dirty_lines.remove(*stable_row);
+        }
 
         // Always send the cursor's row, as that tends to the busiest and we don't
         // have a sequencing concept for our idea of the remote state.
