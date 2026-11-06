@@ -612,3 +612,36 @@ Line {
 "#
     );
 }
+
+/// tmux and similar programs repaint whole screens with identical content. Those writes must not
+/// mark the line as changed, or renderers and every mux client redo all of that work.
+#[test]
+fn identical_writes_keep_the_line_unchanged() {
+    use wezterm_bidi::ParagraphDirectionHint;
+    let attrs = CellAttributes::default();
+    let mut line: Line = "hello".into();
+    line.update_last_change_seqno(2);
+
+    line.set_cell_grapheme(0, "h", 1, attrs.clone(), 3);
+    line.set_cell(1, Cell::new('e', attrs.clone()), 3);
+    line.fill_range(5..80, &Cell::blank(), 3); // erase to the end of the line
+    line.set_bidi_info(false, ParagraphDirectionHint::LeftToRight, 3);
+    assert_eq!(line.current_seqno(), 2);
+
+    line.set_cell_grapheme(0, "j", 1, attrs, 4);
+    assert_eq!(line.current_seqno(), 4);
+    assert_eq!(line.as_str(), "jello");
+}
+
+#[test]
+fn identical_wide_chars_keep_the_line_unchanged() {
+    let mut line: Line = "グa".into();
+    line.update_last_change_seqno(2);
+    line.set_cell_grapheme(0, "グ", 2, CellAttributes::default(), 3);
+    assert_eq!(line.current_seqno(), 2);
+
+    // Writing over the right half of a wide character must still erase that character.
+    line.set_cell(1, Cell::blank(), 4);
+    assert_eq!(line.current_seqno(), 4);
+    assert_eq!(line.as_str(), "  a");
+}

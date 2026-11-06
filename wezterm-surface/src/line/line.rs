@@ -389,6 +389,7 @@ impl Line {
         direction: ParagraphDirectionHint,
         seqno: SequenceNo,
     ) {
+        let prior = self.bits;
         self.bits.set(LineBits::BIDI_ENABLED, enabled);
         let (auto, rtl) = match direction {
             ParagraphDirectionHint::AutoRightToLeft => (true, true),
@@ -398,7 +399,10 @@ impl Line {
         };
         self.bits.set(LineBits::AUTO_DETECT_DIRECTION, auto);
         self.bits.set(LineBits::RTL, rtl);
-        self.update_last_change_seqno(seqno);
+        // Every erase that starts at column 0 re-applies the bidi mode; only an actual change counts.
+        if self.bits != prior {
+            self.update_last_change_seqno(seqno);
+        }
     }
 
     /// Returns a tuple of (BIDI_ENABLED, Direction), indicating whether
@@ -806,7 +810,43 @@ impl Line {
         cells.set_cell(idx, cell, clear);
     }
 
+    /// True if storing `cell` at `idx` would leave the line exactly as it is.
+    fn is_unchanged_by(&self, idx: usize, cell: &Cell) -> bool {
+        let cells = match &self.cells {
+            CellStorage::V(cells) => cells,
+            // Past the end of a packed line, a blank is already implied.
+            CellStorage::C(cl) => return idx > cl.len() && *cell == Cell::blank(),
+        };
+        match cells.get(idx) {
+            Some(existing) if existing == cell => {
+                // Image placements are carried over or cleared by a write, so always treat those as changes.
+                #[cfg(feature = "use_image")]
+                if existing.attrs().images().is_some() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        // Writing over the right half of a wide character erases that character.
+        if idx > 0 && cells[idx - 1].width() > 1 {
+            return false;
+        }
+        // A wide character also blanks the cells it covers.
+        let covered = Cell::blank_with_attrs(cell.attrs().clone());
+        (1..cell.width()).all(|i| cells.get(idx + i) == Some(&covered))
+    }
+
     fn set_cell_impl(&mut self, idx: usize, cell: Cell, clear: bool, seqno: SequenceNo) {
+        // tmux and similar programs repaint whole screens with identical content; counting
+        // those writes as changes made renderers and every mux client redo all of that work.
+        // A write inside a packed line unpacks it below anyway, so do that first to compare cells.
+        if idx < self.len() {
+            self.coerce_vec_storage();
+        }
+        if self.is_unchanged_by(idx, &cell) {
+            return;
+        }
+
         // The .max(1) stuff is here in case we get called with a
         // zero-width cell.  That shouldn't happen: those sequences
         // should get filtered out in the terminal parsing layer,
@@ -990,16 +1030,58 @@ impl Line {
             .iter()
             .rposition(|c| c.str() != " " || c.attrs() != &def_attr)
         {
-            cells.resize_with(end_idx + 1, Cell::blank);
-            self.update_last_change_seqno(seqno);
-            self.invalidate_zones();
+            // Only a line that actually loses cells has changed.
+            if end_idx + 1 < cells.len() {
+                cells.truncate(end_idx + 1);
+                self.update_last_change_seqno(seqno);
+                self.invalidate_zones();
+            }
         }
+    }
+
+    /// True if blanking `cols` would leave the line exactly as it is: the covered cells are already
+    /// blank, and the line ends in a non-blank cell outside the range, so the prune that follows
+    /// removes any blanks the fill adds past the end.
+    fn blank_fill_is_unchanged(&self, cols: &Range<usize>) -> bool {
+        let len = self.len();
+        if len == 0 || cols.contains(&(len - 1)) {
+            return false;
+        }
+        let is_blank =
+            |text: &str, attrs: &CellAttributes| text == " " && *attrs == CellAttributes::blank();
+        let last_is_blank = match &self.cells {
+            CellStorage::V(cells) => is_blank(cells[len - 1].str(), cells[len - 1].attrs()),
+            CellStorage::C(_) => self
+                .visible_cells()
+                .last()
+                .map_or(true, |c| is_blank(c.str(), c.attrs())),
+        };
+        if last_is_blank {
+            return false;
+        }
+        if cols.start >= len {
+            // Only implied blanks past the end are covered.
+            return true;
+        }
+        let CellStorage::V(cells) = &self.cells else {
+            return false;
+        };
+        // Blanking the right half of a wide character erases that character.
+        let splits_wide = cols.start > 0 && cells[cols.start - 1].width() > 1;
+        !splits_wide
+            && cells[cols.start..cols.end.min(len)]
+                .iter()
+                .all(|c| *c == Cell::blank())
     }
 
     pub fn fill_range(&mut self, cols: Range<usize>, cell: &Cell, seqno: SequenceNo) {
         if self.len() == 0 && *cell == Cell::blank() {
             // We would be filling it with blanks only to prune
             // them all away again before we return; NOP
+            return;
+        }
+        if *cell == Cell::blank() && self.blank_fill_is_unchanged(&cols) {
+            // Typically erasing to the end of a line that has nothing there.
             return;
         }
         for x in cols {
