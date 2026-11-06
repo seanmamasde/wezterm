@@ -1028,6 +1028,14 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
         let mut images = vec![];
 
         for (line_idx, (stable_row_idx, line)) in lines.iter_mut().enumerate() {
+            // Lines from the scrollback are already packed, and changing their cells would unpack
+            // them; only do that when there is something to extract.
+            let has_extras = line
+                .visible_cells()
+                .any(|cell| cell.attrs().hyperlink().is_some() || cell.attrs().images().is_some());
+            if !has_extras {
+                continue;
+            }
             let mut current_link: Option<Arc<Hyperlink>> = None;
             let mut current_range = 0..0;
 
@@ -1107,6 +1115,12 @@ impl From<Vec<(StableRowIndex, Line)>> for SerializedLines {
                     }],
                 });
             }
+        }
+
+        // Packed lines are much smaller to send. Pack only now: scanning a packed line's cells
+        // above would have to split its text back into cells.
+        for (_, line) in &mut lines {
+            line.compress_for_scrollback();
         }
 
         Self {
@@ -1301,6 +1315,34 @@ mod test {
             paste,
             "we must read older peers"
         );
+    }
+
+    #[test]
+    fn lines_are_sent_packed() {
+        use termwiz::cell::CellAttributes;
+        use termwiz::surface::SEQ_ZERO;
+        let text = "a plain line of terminal output ".repeat(5);
+        let plain = Line::from_text(&text, &CellAttributes::default(), SEQ_ZERO, None);
+        let mut attrs = CellAttributes::default();
+        attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        let linked = Line::from_text("link", &attrs, SEQ_ZERO, None);
+
+        let sent = SerializedLines::from(vec![(0, plain.clone()), (1, linked)]);
+        for (_, line) in &sent.lines {
+            let mut packed = line.clone();
+            packed.compress_for_scrollback();
+            assert_eq!(*line, packed, "lines must be sent packed");
+        }
+
+        let (data, compressed) = serialize(&sent).unwrap();
+        let (lines, _) = deserialize::<SerializedLines, _>(data.as_slice(), compressed)
+            .unwrap()
+            .extract_data();
+        assert_eq!(lines[0].1.as_str(), plain.as_str());
+        assert!(lines[1]
+            .1
+            .visible_cells()
+            .all(|c| c.attrs().hyperlink().map(|l| l.uri()) == Some("https://example.com")));
     }
 
     #[test]
