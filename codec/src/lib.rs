@@ -297,13 +297,22 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
     if uncompressed.len() <= COMPRESS_THRESH {
         return Ok((uncompressed, false));
     }
-    // It's a little heavy; let's try compressing it
-    let mut compressed = Vec::new();
-    let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    let mut encode = varbincode::Serializer::new(&mut compress);
-    t.serialize(&mut encode)?;
-    drop(encode);
-    compress.finish()?;
+    // It's a little heavy; let's try compressing it.
+    // Compress the finished buffer in one call with a reused context: feeding the serializer's
+    // many tiny writes into a fresh streaming encoder dominated the mux server's CPU time.
+    thread_local! {
+        static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            std::cell::RefCell::new(None);
+    }
+    let compressed = COMPRESSOR.with(|cell| -> std::io::Result<Vec<u8>> {
+        let mut cell = cell.borrow_mut();
+        if cell.is_none() {
+            cell.replace(zstd::bulk::Compressor::new(
+                zstd::DEFAULT_COMPRESSION_LEVEL,
+            )?);
+        }
+        cell.as_mut().unwrap().compress(&uncompressed)
+    })?;
 
     log::debug!(
         "serialized+compress len {} vs {}",
@@ -323,8 +332,11 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     is_compressed: bool,
 ) -> Result<T, Error> {
     if is_compressed {
-        let mut decompress = zstd::Decoder::new(r)?;
-        let mut decode = varbincode::Deserializer::new(&mut decompress);
+        // Decompress in bulk, then deserialize from memory: many tiny reads from a
+        // streaming decoder are slow.
+        let data = zstd::stream::decode_all(r)?;
+        let mut data = data.as_slice();
+        let mut decode = varbincode::Deserializer::new(&mut data);
         serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
     } else {
         let mut decode = varbincode::Deserializer::new(&mut r);
@@ -1249,6 +1261,45 @@ mod test {
                 pdu: Pdu::Pong(Pong {})
             },
             Pdu::decode(encoded.as_slice()).unwrap()
+        );
+    }
+
+    /// What older peers send and expect: varbincode streamed through a zstd stream encoder.
+    fn legacy_serialize<T: serde::Serialize>(t: &T) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        let mut compress =
+            zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL).unwrap();
+        let mut encode = varbincode::Serializer::new(&mut compress);
+        t.serialize(&mut encode).unwrap();
+        drop(encode);
+        compress.finish().unwrap();
+        compressed
+    }
+
+    fn legacy_deserialize<T: serde::de::DeserializeOwned>(data: &[u8]) -> T {
+        let mut decompress = zstd::Decoder::new(data).unwrap();
+        let mut decode = varbincode::Deserializer::new(&mut decompress);
+        serde::Deserialize::deserialize(&mut decode).unwrap()
+    }
+
+    #[test]
+    fn compression_is_compatible_with_older_peers() {
+        let paste = SendPaste {
+            pane_id: 3,
+            data: "some pasted text ".repeat(500),
+        };
+        let (data, compressed) = serialize(&paste).unwrap();
+        assert!(compressed);
+        assert_eq!(
+            legacy_deserialize::<SendPaste>(&data),
+            paste,
+            "older peers must read what we send"
+        );
+        let legacy = legacy_serialize(&paste);
+        assert_eq!(
+            deserialize::<SendPaste, _>(legacy.as_slice(), true).unwrap(),
+            paste,
+            "we must read older peers"
         );
     }
 
