@@ -11,6 +11,8 @@ use ntapi::ntwow64::RTL_USER_PROCESS_PARAMETERS32;
 use std::ffi::OsString;
 use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStringExt;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use winapi::shared::minwindef::{DWORD, FILETIME, LPVOID, MAX_PATH};
 use winapi::shared::ntdef::{FALSE, NT_SUCCESS};
 use winapi::um::handleapi::CloseHandle;
@@ -45,6 +47,23 @@ impl Snapshot {
         match Self::new() {
             Some(snapshot) => snapshot.iter().collect(),
             None => vec![],
+        }
+    }
+
+    /// Returns the entries of a snapshot taken at most `max_age` ago, which
+    /// may have been taken for another caller: taking one walks every thread
+    /// on the system, so callers that poll can share it.
+    fn recent_entries(max_age: Duration) -> Arc<Vec<PROCESSENTRY32W>> {
+        static RECENT: Mutex<Option<(Instant, Arc<Vec<PROCESSENTRY32W>>)>> = Mutex::new(None);
+        let mut recent = RECENT.lock().unwrap_or_else(PoisonError::into_inner);
+        match &*recent {
+            Some((taken, entries)) if taken.elapsed() <= max_age => Arc::clone(entries),
+            _ => {
+                let taken = Instant::now();
+                let entries = Arc::new(Self::entries());
+                recent.replace((taken, Arc::clone(&entries)));
+                entries
+            }
         }
     }
 }
@@ -361,7 +380,17 @@ impl LocalProcessInfo {
         log::trace!("LocalProcessInfo::with_root_pid({}), getting snapshot", pid);
         let procs = Snapshot::entries();
         log::trace!("Got snapshot");
+        Self::from_snapshot(pid, &procs)
+    }
 
+    /// Like `with_root_pid`, but the tree may be built from a snapshot of
+    /// the system's processes that was taken for another call, at most
+    /// `max_age` ago.
+    pub fn with_root_pid_cached(pid: u32, max_age: Duration) -> Option<Self> {
+        Self::from_snapshot(pid, &Snapshot::recent_entries(max_age))
+    }
+
+    fn from_snapshot(pid: u32, procs: &[PROCESSENTRY32W]) -> Option<Self> {
         fn build_proc(
             info: &PROCESSENTRY32W,
             procs: &[PROCESSENTRY32W],
@@ -421,9 +450,26 @@ impl LocalProcessInfo {
         if let Some(info) = procs.iter().find(|info| info.th32ProcessID == pid) {
             let mut visited = HashSet::new();
             visited.insert(pid);
-            Some(build_proc(info, &procs, &mut visited))
+            Some(build_proc(info, procs, &mut visited))
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn recent_snapshots_are_shared() {
+        let hour = Duration::from_secs(3600);
+        let first = Snapshot::recent_entries(hour);
+        assert!(Arc::ptr_eq(&first, &Snapshot::recent_entries(hour)));
+        let fresh = Snapshot::recent_entries(Duration::ZERO);
+        assert!(!Arc::ptr_eq(&first, &fresh));
+
+        let me = LocalProcessInfo::with_root_pid_cached(std::process::id(), hour).unwrap();
+        assert_eq!(me.pid, std::process::id());
     }
 }

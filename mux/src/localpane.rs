@@ -98,7 +98,8 @@ impl CachedProcInfo {
     /// Otherwise stale info is returned right away and refreshed in another
     /// thread: on Windows that means snapshotting every process and thread
     /// on the system, and the mux server asks for this for every update
-    /// that it sends to a client.
+    /// that it sends to a client. Those refreshes share snapshots between
+    /// panes.
     fn get(
         cache: &Arc<Mutex<Option<Self>>>,
         pid: u32,
@@ -111,7 +112,9 @@ impl CachedProcInfo {
                     info.updating = true;
                     let cache = Arc::clone(cache);
                     std::thread::spawn(move || {
-                        let fresh = LocalProcessInfo::with_root_pid(pid).map(Self::new);
+                        let fresh =
+                            LocalProcessInfo::with_root_pid_cached(pid, PROC_INFO_CACHE_TTL)
+                                .map(Self::new);
                         let mut cached = cache.lock();
                         if let Some(fresh) = fresh {
                             cached.replace(fresh);

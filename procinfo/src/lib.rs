@@ -96,4 +96,11 @@ impl LocalProcessInfo {
     pub fn executable_path(_pid: u32) -> Option<PathBuf> {
         None
     }
+
+    /// Like `with_root_pid`; only on Windows may the tree be built from a
+    /// snapshot of the system's processes that was taken for another call.
+    #[cfg(not(windows))]
+    pub fn with_root_pid_cached(pid: u32, _max_age: std::time::Duration) -> Option<Self> {
+        Self::with_root_pid(pid)
+    }
 }
