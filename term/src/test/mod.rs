@@ -1378,3 +1378,32 @@ fn test_hyperlinks() {
         Compare::TEXT | Compare::ATTRS,
     );
 }
+
+/// Multiplexers such as tmux repaint whole panes with identical content; that must not mark rows as
+/// changed, or every renderer and mux client redoes all of that work for each repaint.
+#[test]
+fn identical_repaint_keeps_rows_unchanged() {
+    let mut term = TestTerm::new(3, 20, 0);
+    // The way tmux repaints a pane: home, then each row's text, erase to end of line, CR LF.
+    let repaint = |term: &mut TestTerm| {
+        term.cup(0, 0);
+        term.print("\x1b[38;2;10;200;30mhello\x1b[0m world");
+        term.erase_in_line(EraseInLine::EraseToEndOfLine);
+        term.print("\r\n");
+        term.print("second");
+        term.erase_in_line(EraseInLine::EraseToEndOfLine);
+        term.print("\r\n");
+    };
+    repaint(&mut term);
+    let seqno = term.current_seqno();
+    repaint(&mut term);
+    assert_eq!(
+        term.screen().get_changed_stable_rows(0..2, seqno),
+        Vec::<StableRowIndex>::new()
+    );
+
+    term.cup(0, 1);
+    term.print("S");
+    assert_eq!(term.screen().get_changed_stable_rows(0..2, seqno), vec![1]);
+    assert_visible_contents(&term, file!(), line!(), &["hello world", "Second", ""]);
+}

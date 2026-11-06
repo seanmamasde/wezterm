@@ -389,9 +389,8 @@ impl<'a> Performer<'a> {
                     } else {
                         (old_y + 1).min(self.screen().physical_rows as i64 - 1)
                     };
-                    self.screen_mut().dirty_line(old_y, seqno);
-                    self.screen_mut().dirty_line(y, seqno);
                     self.cursor.y = y;
+                    self.cursor.seqno = seqno;
                     self.wrap_next = false;
                 }
                 if self.newline_mode {
@@ -405,10 +404,11 @@ impl<'a> Performer<'a> {
                 } else {
                     self.cursor.x = 0;
                 }
-                let y = self.cursor.y;
                 self.wrap_next = false;
                 self.clear_semantic_attribute_due_to_movement();
-                self.screen_mut().dirty_line(y, seqno);
+                // Like other cursor moves, tag the cursor rather than the line: tmux ends every row
+                // of a repaint with CR LF, which made each repaint mark every row as changed.
+                self.cursor.seqno = seqno;
             }
 
             ControlCode::Backspace => {

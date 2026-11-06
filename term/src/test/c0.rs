@@ -27,11 +27,8 @@ fn test_cr() {
     term.assert_cursor_pos(
         0,
         0,
-        Some(
-            "CR moves to left margin on current line, \
-             but is unchanged relative to the initial state",
-        ),
-        Some(0),
+        Some("CR moves to left margin on current line, tagging the cursor rather than the line"),
+        None,
     );
     // TODO: when we can set the left margin, we should test that here
 }
