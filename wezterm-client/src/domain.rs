@@ -14,6 +14,7 @@ use mux::{Mux, MuxNotification};
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use wezterm_term::TerminalSize;
 
@@ -26,6 +27,8 @@ pub struct ClientInner {
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    /// Set while applying the server's pane tree, whose sizes must not be sent back to it.
+    pub applying_remote_layout: AtomicBool,
 }
 
 impl ClientInner {
@@ -246,6 +249,7 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
+            applying_remote_layout: AtomicBool::new(false),
         }
     }
 }
@@ -577,6 +581,9 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
+                // These sizes come from the server. Echoing them back as resize requests raced with
+                // our own pending resizes, and attached clients then bounced sizes off each other.
+                inner.applying_remote_layout.store(true, Ordering::Relaxed);
                 tab.sync_with_pane_tree(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
@@ -617,6 +624,7 @@ impl ClientDomain {
                         pane
                     }
                 });
+                inner.applying_remote_layout.store(false, Ordering::Relaxed);
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let mut window = mux

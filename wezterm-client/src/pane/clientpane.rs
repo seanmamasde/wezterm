@@ -409,6 +409,15 @@ impl Pane for ClientPane {
             // Invalidate any cached rows on a resize
             inner.make_all_stale();
 
+            if self
+                .client
+                .applying_remote_layout
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // The server already has this size; it came from its own pane tree.
+                return Ok(());
+            }
+
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
